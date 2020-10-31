@@ -1,0 +1,21 @@
+import distutils.command.build_ext
+import distutils.core
+import distutils.extension
+import os.path
+import sys
+import sysconfig
+
+name = os.path.splitext(os.path.basename(__file__))[0]
+home = os.path.abspath(sys.path[0])
+extra_compile_args  = sysconfig.get_config_var('CFLAGS').split()
+extra_compile_args += ['-UCYTHON_REFNANNY']
+
+distutils.core.setup(
+    ext_modules=[
+        distutils.extension.Extension(
+                          name=name,
+                       sources=[os.path.join(home, name + '.c')],
+            extra_compile_args=extra_compile_args
+        )
+    ]
+)

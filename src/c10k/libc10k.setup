@@ -1,0 +1,33 @@
+import distutils.command.build_ext
+import distutils.core
+import distutils.extension
+import os.path
+import sys
+import sysconfig
+
+name = os.path.splitext(os.path.basename(__file__))[0]
+home = os.path.abspath(sys.path[0])
+
+class specialized_build_ext(distutils.command.build_ext.build_ext):
+
+    def get_ext_filename(self, ext_name):
+        old_ext_suffix = sysconfig.get_config_var('EXT_SUFFIX')
+        new_ext_suffix = os.path.splitext(old_ext_suffix)[1]
+        return super(specialized_build_ext, self) \
+              .get_ext_filename(ext_name)         \
+              .replace(old_ext_suffix, new_ext_suffix)
+
+distutils.core.setup(
+    ext_modules=[
+        distutils.extension.Extension(
+                       name=name,
+                    sources=[os.path.join(home, name + '.c')],
+            extra_link_args=
+                [
+                    f'-Wl,-init,{name}__init__',
+                    f'-Wl,-fini,{name}__fini__'
+                ]
+        )
+    ],
+    cmdclass={'build_ext': specialized_build_ext}
+)
