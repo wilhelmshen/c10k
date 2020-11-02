@@ -21,12 +21,12 @@ distutils.sysconfig.get_config_var('EXT_SUFFIX') or '.so')[1])
 endef
 LIB_EXT_SUFFIX := $(shell $(PYTHON) -c "$(PY_CONFIG_VAR_LIB_EXT_SUFFIX)")
 
-PYX_SOURCES := $(wildcard *.pyx)
-SOURCES     := $(PYX_SOURCES:.pyx=.c)
-HEADERS     := $(PYX_SOURCES:.pyx=.h)
-PYX_MODULES := $(PYX_SOURCES:.pyx=$(PYX_EXT_SUFFIX))
-LIB_MODULES := libc10k$(LIB_EXT_SUFFIX)
-MODULES     := $(PYX_MODULES) $(LIB_MODULES)
+PYX_SOURCES   := $(wildcard *.pyx)
+PYX_C_SOURCES := $(PYX_SOURCES:.pyx=.c)
+PYX_C_HEADERS := $(PYX_SOURCES:.pyx=.h)
+PYX_MODULES   := $(PYX_SOURCES:.pyx=$(PYX_EXT_SUFFIX))
+LIB_MODULES   := libc10k$(LIB_EXT_SUFFIX)
+MODULES       := $(PYX_MODULES) $(LIB_MODULES)
 
 all: $(MODULES)
 
@@ -40,7 +40,11 @@ all: $(MODULES)
 	$(CYTHON) --embed -I. -IIncludes $<
 
 clean:
-	rm -rf build $(MODULES) $(SOURCES) $(HEADERS) __pycache__
+	rm -rf        build      \
+		   $(MODULES)    \
+		$(PYX_C_SOURCES) \
+		$(PYX_C_HEADERS) \
+		   __pycache__
 	find . -name '*.pyc' -exec rm {} \;
 	find . -name '__pycache__' -exec rm -d {} \;
 

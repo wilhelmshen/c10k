@@ -37,7 +37,8 @@ def run(program, args):
     lib_path       = os.path.abspath(os.path.dirname(__file__))
     libc10k_so     = os.path.join(lib_path,   'libc10k'  +lib_ext_suffix)
     C10kPthread_so = os.path.join(lib_path, 'C10kPthread'+pyx_ext_suffix)
-    libs = [libpython_so, C10kPthread_so, libc10k_so]
+    C10kSocket_so  = os.path.join(lib_path,  'C10kSocket'+pyx_ext_suffix)
+    libs = [libpython_so, C10kPthread_so, C10kSocket_so, libc10k_so]
     platform = sys.platform.lower()
     if 'linux' in platform:
         if 'LD_PRELOAD' in os.environ:
