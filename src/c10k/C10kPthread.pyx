@@ -1,15 +1,24 @@
 # coding:      utf-8
 # cython: language_level=3
 
+cimport cpython.mem
 cimport cpython.object
 cimport cpython.ref
 cimport cython
 cimport libc.errno
 cimport libc.stdint
 cimport libc.stdio
+cimport libc.stdlib
 cimport posix.time
 
 from pthread cimport *
+
+cdef extern from '<errno.h>':
+
+    enum:
+        EDEADLK,    # 35  Resource deadlock would occur
+        # for robust mutexes
+        EOWNERDEAD  # 130 Owner died
 
 cdef extern from '<Python.h>':
 
@@ -73,7 +82,6 @@ cdef extern from '_gevent_cgreenlet.h':
 cdef extern from 'C10kPthread.h':
 
     cpython.object.PyObject* __pyx_empty_tuple
-
     cpython.object.PyObject* __Pyx_PyObject_CallOneArg \
         (
             cpython.object.PyObject *,
@@ -82,13 +90,17 @@ cdef extern from 'C10kPthread.h':
 
 cdef public int C10kPthread_concurrency = 0
 cdef public int C10kPthread_initialized = 0
-cdef int EDEADLK    = 35
-cdef int EOWNERDEAD = 130
-cdef pthread_t C10kPthread_LIMBO = <pthread_t><libc.stdint.uintptr_t>0
-cdef pthread_once_t C10kPthread_ONCE_DONE = <pthread_once_t><int>0xff
+cdef pthread_once_t ONCE_DONE = <pthread_once_t><int>0xff
+cdef pthread_t TH_MAIN = <pthread_t><libc.stdint.uintptr_t>0
+
+###########################################################################
+
+import sys
+# TODO
+# sys.setswitchinterval(0xffffffff)
 
 import gevent.greenlet
-
+# XXX
 gevent.greenlet._cancelled_start_event = gevent.greenlet._dummy_event()
 gevent.greenlet._start_completed_event = gevent.greenlet._dummy_event()
 
@@ -99,12 +111,17 @@ import weakref
 
 from gevent._greenlet import Greenlet
 
-hub       = gevent.get_hub()
-greenlets = {}
+g_main    = gevent.getcurrent()
+greenlets = \
+    {
+        <unsigned long><libc.stdint.uintptr_t>TH_MAIN            : g_main,
+        <unsigned long><libc.stdint.uintptr_t><PyGreenlet*>g_main: g_main
+    }
 mutexes   = {}
 rwlocks   = {}
 conds     = {}
-greenlets[<unsigned long><libc.stdint.uintptr_t>C10kPthread_LIMBO] = hub
+
+###########################################################################
 
 cdef class Attr:
 
@@ -119,13 +136,13 @@ cdef class Attr:
 
     cdef int init(self, const pthread_attr_t *attr):
         if NULL == attr:
-            return self.set_default_np()
+            return self.set_default()
         else:
             return self.set(attr)
 
-    cdef int set_default_np(self):
+    cdef int set_default(self):
         cdef pthread_attr_t attr
-        err = pthread_getattr_default_np(&attr)
+        err = pthread_attr_init(&attr)
         if err != 0:
             return err
         return self.set(&attr)
@@ -304,6 +321,7 @@ cdef void __cancel(pthread_t th, void *retval):
         <cpython.object.PyObject*>(<greenlet>g).parent
     (<PyGreenlet*>g).stack_start = NULL
     del g
+    # XXX
     _PyObject_CallMethod(pMyHub, b'switch', NULL)
 
 # Make calling thread wait for termination of the thread TH.  The
@@ -313,6 +331,7 @@ cdef void __cancel(pthread_t th, void *retval):
 # This function is a cancellation point and therefore not marked with
 # __THROW.
 cdef public int pthread_join(pthread_t th, void **thread_return):
+    libc.stdio.printf('pthread_join\n')
     key = <unsigned long><libc.stdint.uintptr_t>th
     try:
         g = greenlets[key]
@@ -402,11 +421,17 @@ cdef public int pthread_detach(pthread_t th):
 cdef public pthread_t pthread_self():
     cdef pthread_t th
     if C10kPthread_initialized:
-        g  = gevent.getcurrent()
-        th = <pthread_t><libc.stdint.uintptr_t><cpython.object.PyObject*>g
-        return th
+        g = gevent.getcurrent()
+        if g is g_main:
+            return TH_MAIN
+        else:
+            th = \
+                        <pthread_t>       \
+                  <libc.stdint.uintptr_t> \
+                <cpython.object.PyObject*>g
+            return th
     else:
-        return C10kPthread_LIMBO
+        return TH_MAIN
 
 # Compare two thread identifiers.
 cdef public int pthread_equal(pthread_t thread1, pthread_t thread2):
@@ -601,7 +626,7 @@ cdef public int pthread_once \
         void (*init_routine) ()
     ):
     if PTHREAD_ONCE_INIT == once_control[0]:
-        once_control[0] = C10kPthread_ONCE_DONE
+        once_control[0] = ONCE_DONE
         init_routine()
         return 0
     else:
@@ -703,7 +728,18 @@ cdef class MutexAttr:
     cdef int robustness
 
     cdef int init(self, const pthread_mutexattr_t *attr):
-        return self.set(attr)
+        if NULL == attr:
+            return self.set_default()
+        else:
+            return self.set(attr)
+
+    cdef int set_default(self):
+        cdef pthread_mutexattr_t attr
+        cdef int err
+        err = pthread_mutexattr_init(&attr)
+        if err != 0:
+            return err
+        return self.set(&attr)
 
     cdef int set(self, const pthread_mutexattr_t *attr):
         err = pthread_mutexattr_getpshared(attr, &self.pshared)
@@ -820,8 +856,11 @@ cdef public int pthread_mutex_init \
         pthread_mutex_t *mutex,
         const pthread_mutexattr_t *mutexattr
     ):
+    if not C10kPthread_initialized:
+        (<libc.stdint.uintptr_t*>mutex)[0] = 0
+        return 0
     pAttr = MutexAttr()
-    cdef int err = pAttr.set(mutexattr)
+    cdef int err = pAttr.init(mutexattr)
     if err != 0:
         return err
     pMutex = Mutex()
@@ -838,10 +877,9 @@ cdef public int pthread_mutex_init \
 
 # Destroy a mutex.
 cdef public int pthread_mutex_destroy(pthread_mutex_t *mutex):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    if 0 == (<libc.stdint.uintptr_t*>mutex)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
         del mutexes[key]
     except KeyError:
@@ -851,24 +889,20 @@ cdef public int pthread_mutex_destroy(pthread_mutex_t *mutex):
 
 # Try locking a mutex.
 cdef public int pthread_mutex_trylock(pthread_mutex_t *mutex):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     return pMutex.acquire(False, None)
 
 # Lock a mutex.
 cdef public int pthread_mutex_lock(pthread_mutex_t *mutex):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    if 0 == (<libc.stdint.uintptr_t*>mutex)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     return pMutex.acquire(True, None)
@@ -879,12 +913,9 @@ cdef public int pthread_mutex_timedlock \
         pthread_mutex_t *mutex,
         const posix.time.timespec *abstime
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     timeout = <long>abstime.tv_sec
@@ -892,12 +923,11 @@ cdef public int pthread_mutex_timedlock \
 
 # Unlock a mutex.
 cdef public int pthread_mutex_unlock(pthread_mutex_t *mutex):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    if 0 == (<libc.stdint.uintptr_t*>mutex)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     return pMutex.release()
@@ -908,12 +938,9 @@ cdef public int pthread_mutex_getprioceiling \
         const pthread_mutex_t *mutex,
         int *prioceiling
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     prioceiling[0] = pMutex.attr.prioceiling
@@ -928,12 +955,9 @@ cdef public int pthread_mutex_setprioceiling \
         int  prioceiling,
         int *old_ceiling
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     g = gevent.getcurrent()
@@ -964,12 +988,9 @@ cdef public int pthread_mutex_setprioceiling \
 #
 # Declare the state protected by MUTEX as consistent.
 cdef public int pthread_mutex_consistent(pthread_mutex_t *mutex):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>mutex)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
     try:
-        pMutex = mutexes[key]
+        pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
     if pMutex.attr.robustness:
@@ -990,7 +1011,18 @@ cdef class RwlockAttr:
     cdef int pref
 
     cdef int init(self, const pthread_rwlockattr_t *attr):
-        return self.set(attr)
+        if NULL == attr:
+            return self.set_default()
+        else:
+            return self.set(attr)
+
+    cdef int set_default(self):
+        cdef pthread_rwlockattr_t attr
+        cdef int err
+        err = pthread_rwlockattr_init(&attr)
+        if err != 0:
+            return err
+        return self.set(&attr)
 
     cdef int set(self, const pthread_rwlockattr_t *attr):
         err = pthread_rwlockattr_getpshared(attr, &self.pshared)
@@ -1010,7 +1042,7 @@ cdef class RwlockAttr:
             return err
         return 0
 
-cdef class Rwlock__BAD:
+cdef class Rwlock_PREFER_READER:
 
     cdef RwlockAttr attr
     cdef int    balance
@@ -1097,10 +1129,10 @@ cdef public int pthread_rwlock_init \
         const pthread_rwlockattr_t *attr
     ):
     pAttr = RwlockAttr()
-    cdef int err = pAttr.set(attr)
+    cdef int err = pAttr.init(attr)
     if err != 0:
         return err
-    pRwlock = Rwlock__BAD()
+    pRwlock = Rwlock_PREFER_READER()
     pRwlock.attr = pAttr
     key = \
               <unsigned long>     \
@@ -1114,10 +1146,7 @@ cdef public int pthread_rwlock_init \
 
 # Destroy read-write lock RWLOCK.
 cdef public int pthread_rwlock_destroy(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         del rwlocks[key]
     except KeyError:
@@ -1127,10 +1156,7 @@ cdef public int pthread_rwlock_destroy(pthread_rwlock_t *rwlock):
 
 # Acquire read lock for RWLOCK.
 cdef public int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1139,10 +1165,7 @@ cdef public int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock):
 
 # Try to acquire read lock for RWLOCK.
 cdef public int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1155,10 +1178,7 @@ cdef public int pthread_rwlock_timedrdlock \
         pthread_rwlock_t *rwlock,
         const posix.time.timespec *abstime
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1168,10 +1188,7 @@ cdef public int pthread_rwlock_timedrdlock \
 
 # Acquire write lock for RWLOCK.
 cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1180,10 +1197,7 @@ cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
 
 # Try to acquire write lock for RWLOCK.
 cdef public int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1196,10 +1210,7 @@ cdef public int pthread_rwlock_timedwrlock \
         pthread_rwlock_t *rwlock,
         const posix.time.timespec *abstime
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1209,10 +1220,7 @@ cdef public int pthread_rwlock_timedwrlock \
 
 # Unlock RWLOCK.
 cdef public int pthread_rwlock_unlock(pthread_rwlock_t *rwlock):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>rwlock)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
         pRwlock = rwlocks[key]
     except KeyError:
@@ -1230,7 +1238,18 @@ cdef class CondAttr:
     cdef __clockid_t clock_id
 
     cdef int init(self, const pthread_condattr_t *attr):
-        return self.set(attr)
+        if NULL == attr:
+            return self.set_default()
+        else:
+            return self.set(attr)
+
+    cdef int set_default(self):
+        cdef pthread_condattr_t attr
+        cdef int err
+        err = pthread_condattr_init(&attr)
+        if err != 0:
+            return err
+        return self.set(&attr)
 
     cdef int set(self, const pthread_condattr_t *attr):
         err = pthread_condattr_getpshared(attr, &self.pshared)
@@ -1265,8 +1284,11 @@ cdef public int pthread_cond_init \
         pthread_cond_t *cond,
         const pthread_condattr_t *cond_attr
     ):
+    if not C10kPthread_initialized:
+        (<libc.stdint.uintptr_t*>cond)[0] = 0
+        return 0
     pAttr = CondAttr()
-    cdef int err = pAttr.set(cond_attr)
+    cdef int err = pAttr.init(cond_attr)
     if err != 0:
         return err
     pCond = Cond()
@@ -1283,10 +1305,7 @@ cdef public int pthread_cond_init \
 
 # Destroy condition variable COND.
 cdef public int pthread_cond_destroy(pthread_cond_t *cond):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>cond)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
         del conds[key]
     except KeyError:
@@ -1296,24 +1315,20 @@ cdef public int pthread_cond_destroy(pthread_cond_t *cond):
 
 # Wake up one thread waiting for condition variable COND.
 cdef public int pthread_cond_signal(pthread_cond_t *cond):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>cond)[0]
+    if 0 == (<libc.stdint.uintptr_t*>cond)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
-        del conds[key]
+        pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
     return 0
 
 # Wake up all threads waiting for condition variables COND.
 cdef public int pthread_cond_broadcast(pthread_cond_t *cond):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>cond)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
-        del conds[key]
+        pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
     return 0
@@ -1328,12 +1343,11 @@ cdef public int pthread_cond_wait \
         pthread_cond_t *cond,
         pthread_mutex_t *mutex
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>cond)[0]
+    if 0 == (<libc.stdint.uintptr_t*>cond)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
-        del conds[key]
+        pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
     return 0
@@ -1351,12 +1365,9 @@ cdef public int pthread_cond_timedwait \
         pthread_mutex_t *mutex,
         const posix.time.timespec *abstime
     ):
-    key = \
-             <unsigned long> \
-         <libc.stdint.uintptr_t> \
-        (<libc.stdint.uintptr_t*>cond)[0]
+    key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
-        del conds[key]
+        pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
     timeout = <long>abstime.tv_sec
@@ -1398,7 +1409,18 @@ cdef class BarrierAttr:
     cdef int pshared
 
     cdef int init(self, const pthread_barrierattr_t *attr):
-        return self.set(attr)
+        if NULL == attr:
+            return self.set_default()
+        else:
+            return self.set(attr)
+
+    cdef int set_default(self):
+        cdef pthread_barrierattr_t attr
+        cdef int err
+        err = pthread_barrierattr_init(&attr)
+        if err != 0:
+            return err
+        return self.set(&attr)
 
     cdef int set(self, const pthread_barrierattr_t *attr):
         return pthread_barrierattr_getpshared(attr, &self.pshared)

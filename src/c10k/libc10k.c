@@ -15,29 +15,35 @@ void libc10k__init__()
         return;
     if (PyImport_AppendInittab( "c10k.C10kPthread",
                                PyInit_C10kPthread) == -1) {
-        errno = 1;
-        perror("could not extend in-built modules table");
+        errno = 80;
+        perror(
+            "c10k.C10kPthread: could not extend in-built modules table"
+        );
         exit(errno);
     }
     if (PyImport_AppendInittab( "c10k.C10kSocket",
                                PyInit_C10kSocket) == -1) {
-        errno = 1;
-        perror("could not extend in-built modules table");
+        errno = 80;
+        perror(
+            "c10k.C10kSocket: could not extend in-built modules table"
+        );
         exit(errno);
     }
     Py_Initialize();
     pC10kPthreadModule = PyImport_ImportModule("c10k.C10kPthread");
     if (NULL == pC10kPthreadModule) {
-        errno = 2;
-        perror("c10k.C10kPthread");
+        errno = 80;
+        perror("c10k.C10kPthread: ImportError");
+        PyErr_Print();
         exit(errno);
     } else {
         C10kPthread_initialized = 1;
     }
     pC10kSocketModule = PyImport_ImportModule("c10k.C10kSocket");
     if (NULL == pC10kSocketModule) {
-        errno = 2;
-        perror("c10k.C10kSocket");
+        errno = 80;
+        perror("c10k.C10kSocket: ImportError");
+        PyErr_Print();
         exit(errno);
     } else {
         C10kSocket_initialized = 1;

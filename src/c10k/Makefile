@@ -48,6 +48,6 @@ clean:
 	find . -name '*.pyc' -exec rm {} \;
 	find . -name '__pycache__' -exec rm -d {} \;
 
-.PRECIOUS: $(SOURCES)
+.PRECIOUS: $(PYX_C_SOURCES)
 
 .PHONY: all clean
