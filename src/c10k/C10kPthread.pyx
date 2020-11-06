@@ -88,16 +88,18 @@ cdef extern from 'C10kPthread.h':
             cpython.object.PyObject *
         )
 
-cdef public int C10kPthread_concurrency = 0
 cdef public int C10kPthread_initialized = 0
-cdef pthread_once_t ONCE_DONE = <pthread_once_t><int>0xff
+cdef        int __concurrency = 0
+cdef pthread_key_t  key_limbo = <pthread_key_t><libc.stdint.uintptr_t>0
+cdef void *key_limbo_specific
+cdef pthread_once_t ONCE_DONE = <pthread_once_t><unsigned int>-1
 cdef pthread_t TH_MAIN = <pthread_t><libc.stdint.uintptr_t>0
 
 ###########################################################################
 
 import sys
 # TODO
-# sys.setswitchinterval(0xffffffff)
+#sys.setswitchinterval(0xffffffff)
 
 import gevent.greenlet
 # XXX
@@ -106,7 +108,9 @@ gevent.greenlet._start_completed_event = gevent.greenlet._dummy_event()
 
 import gevent
 import gevent.event
+import gevent.local
 import gevent.lock
+import gevent.queue
 import weakref
 
 from gevent._greenlet import Greenlet
@@ -120,6 +124,8 @@ greenlets = \
 mutexes   = {}
 rwlocks   = {}
 conds     = {}
+local     = gevent.local.local()
+LOCAL_KEY_NAME = 'C10kPthreadKey'
 
 ###########################################################################
 
@@ -331,7 +337,6 @@ cdef void __cancel(pthread_t th, void *retval):
 # This function is a cancellation point and therefore not marked with
 # __THROW.
 cdef public int pthread_join(pthread_t th, void **thread_return):
-    libc.stdio.printf('pthread_join\n')
     key = <unsigned long><libc.stdint.uintptr_t>th
     try:
         g = greenlets[key]
@@ -569,13 +574,13 @@ cdef public int pthread_setname_np \
 
 # Determine level of concurrency.
 cdef public int pthread_getconcurrency():
-    return C10kPthread_concurrency
+    return __concurrency
 
 # Set new concurrency level to LEVEL.
 cdef public int pthread_setconcurrency(int level):
     if level < 0:
         return libc.errno.EINVAL
-    C10kPthread_concurrency = level
+    __concurrency = level
     return 0
 
 # Yield the processor to another thread or process.
@@ -918,8 +923,7 @@ cdef public int pthread_mutex_timedlock \
         pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
-    timeout = <long>abstime.tv_sec
-    return pMutex.acquire(True, timeout)
+    return pMutex.acquire(True, <long>abstime.tv_sec)
 
 # Unlock a mutex.
 cdef public int pthread_mutex_unlock(pthread_mutex_t *mutex):
@@ -1183,8 +1187,7 @@ cdef public int pthread_rwlock_timedrdlock \
         pRwlock = rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
-    timeout = <long>abstime.tv_sec
-    return pRwlock.rd_acquire(True, timeout)
+    return pRwlock.rd_acquire(True, <long>abstime.tv_sec)
 
 # Acquire write lock for RWLOCK.
 cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
@@ -1215,8 +1218,7 @@ cdef public int pthread_rwlock_timedwrlock \
         pRwlock = rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
-    timeout = <long>abstime.tv_sec
-    return pRwlock.wr_acquire(True, timeout)
+    return pRwlock.wr_acquire(True, <long>abstime.tv_sec)
 
 # Unlock RWLOCK.
 cdef public int pthread_rwlock_unlock(pthread_rwlock_t *rwlock):
@@ -1227,7 +1229,6 @@ cdef public int pthread_rwlock_unlock(pthread_rwlock_t *rwlock):
         return libc.errno.ESRCH
     return pRwlock.release()
 
-# TODO
 ###########################################################################
 #              Functions for handling conditional variables.              #
 ###########################################################################
@@ -1272,6 +1273,10 @@ cdef class CondAttr:
 cdef class Cond:
 
     cdef CondAttr attr
+    cdef public object queue
+
+    def __init__(self):
+        self.queue = gevent.queue.Queue()
 
     cdef int init(self, CondAttr attr):
         self.attr = attr
@@ -1322,7 +1327,12 @@ cdef public int pthread_cond_signal(pthread_cond_t *cond):
         pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
-    return 0
+    queue = pCond.queue
+    if len(queue.getters) > 0:
+        queue.put(None)
+        return 0
+    else:
+        return 0
 
 # Wake up all threads waiting for condition variables COND.
 cdef public int pthread_cond_broadcast(pthread_cond_t *cond):
@@ -1331,7 +1341,14 @@ cdef public int pthread_cond_broadcast(pthread_cond_t *cond):
         pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
-    return 0
+    queue = pCond.queue
+    if len(queue.getters) > 0:
+        pCond.queue = gevent.queue.Queue()
+        while len(queue.getters) > 0:
+            queue.put(None)
+        return 0
+    else:
+        return 0
 
 # Wait for condition variable COND to be signaled or broadcast.
 # MUTEX is assumed to be locked before.
@@ -1350,6 +1367,7 @@ cdef public int pthread_cond_wait \
         pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
+    pCond.queue.get(block=True)
     return 0
 
 # Wait for condition variable COND to be signaled or broadcast until
@@ -1370,14 +1388,14 @@ cdef public int pthread_cond_timedwait \
         pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
-    timeout = <long>abstime.tv_sec
+    pCond.queue.get(block=True, timeout=<long>abstime.tv_sec)
     return 0
 
 # TODO
 ###########################################################################
 #                     Functions to handle spinlocks.                      #
 ###########################################################################
-
+'''
 # Initialize the spinlock LOCK.  If PSHARED is nonzero the spinlock can
 # be shared between different processes.
 cdef public int pthread_spin_init(pthread_spinlock_t *lock, int pshared):
@@ -1398,12 +1416,12 @@ cdef public int pthread_spin_trylock(pthread_spinlock_t *lock):
 # Release spinlock LOCK.
 cdef public int pthread_spin_unlock(pthread_spinlock_t *lock):
     return 0
-
+'''
 # TODO
 ###########################################################################
 #                      Functions to handle barriers.                      #
 ###########################################################################
-
+'''
 cdef class BarrierAttr:
 
     cdef int pshared
@@ -1453,11 +1471,19 @@ cdef public int pthread_barrier_destroy(pthread_barrier_t *barrier):
 # Wait on barrier BARRIER.
 cdef public int pthread_barrier_wait(pthread_barrier_t *barrier):
     return 0
-
-# TODO
+'''
 ###########################################################################
 #              Functions for handling thread-specific data.               #
 ###########################################################################
+
+cdef class Key:
+
+    cdef void *specific
+    cdef (void (*) (void *) nogil) destr_function
+
+    def __dealloc__(self):
+        if self.specific != NULL and self.destr_function != NULL:
+            self.destr_function(self.specific)
 
 # Create a key value identifying a location in the thread-specific
 # data area.  Each thread maintains a distinct thread-specific data
@@ -1468,17 +1494,52 @@ cdef public int pthread_barrier_wait(pthread_barrier_t *barrier):
 cdef public int pthread_key_create \
     (
         pthread_key_t *key,
-        void (*destr_function) (void *)
+        void (*destr_function) (void *) nogil
     ):
+    global key_limbo_specific
+    if not C10kPthread_initialized:
+        key_limbo_specific = NULL
+        key[0] = key_limbo
+        return 0
+    if LOCAL_KEY_NAME not in local.__dict__:
+        local.__dict__[LOCAL_KEY_NAME] = {}
+    pKey = Key()
+    pKey.specific = NULL
+    pKey.destr_function = destr_function
+    id_ = \
+              <unsigned long>     \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pKey
+    local.__dict__[LOCAL_KEY_NAME][id_] = pKey
+    key[0] = \
+              <pthread_key_t>     \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pKey
     return 0
 
 # Destroy KEY.
 cdef public int pthread_key_delete(pthread_key_t key):
+    if LOCAL_KEY_NAME not in local.__dict__:
+        return libc.errno.ESRCH
+    id_ = <unsigned long><libc.stdint.uintptr_t>key
+    try:
+        del local.__dict__[id_]
+    except KeyError:
+        return libc.errno.ESRCH
     return 0
 
 # Return current value of the thread-specific data slot identified by KEY.
 cdef public void *pthread_getspecific(pthread_key_t key):
-    return NULL
+    if key == key_limbo:
+        return key_limbo_specific
+    if LOCAL_KEY_NAME not in local.__dict__:
+        return NULL
+    id_ = <unsigned long><libc.stdint.uintptr_t>key
+    try:
+        pKey = <Key?>local.__dict__[id_]
+    except KeyError:
+        return NULL
+    return pKey.specific
 
 # Store POINTER in the thread-specific data slot identified by KEY.
 cdef public int pthread_setspecific \
@@ -1486,6 +1547,18 @@ cdef public int pthread_setspecific \
         pthread_key_t key,
         const void *pointer
     ):
+    global key_limbo_specific
+    if key == key_limbo:
+        key_limbo_specific = pointer
+        return 0
+    if LOCAL_KEY_NAME not in local.__dict__:
+        return libc.errno.ESRCH
+    id_ = <unsigned long><libc.stdint.uintptr_t>key
+    try:
+        pKey = <Key?>local.__dict__[id_]
+    except KeyError:
+        return libc.errno.ESRCH
+    pKey.specific = pointer
     return 0
 
 # TODO
@@ -1502,7 +1575,7 @@ cdef public int pthread_setspecific \
 # first called before FORK), and the PARENT and CHILD handlers are called #
 # in FIFO (first added, first called).                                    #
 ###########################################################################
-
+'''
 cdef public int pthread_atfork \
     (
         void (*prepare) (),
@@ -1510,3 +1583,4 @@ cdef public int pthread_atfork \
         void (*child) ()
     ):
     return 0
+'''
