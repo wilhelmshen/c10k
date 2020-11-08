@@ -10,6 +10,8 @@ cimport libc.stdint
 cimport libc.stdio
 cimport libc.stdlib
 cimport posix.time
+cimport posix.types
+cimport posix.unistd
 
 from pthread cimport *
 
@@ -125,7 +127,7 @@ mutexes   = {}
 rwlocks   = {}
 conds     = {}
 local     = gevent.local.local()
-LOCAL_KEY_NAME = 'C10kPthreadKey'
+LOCAL_KEY = 'C10kPthreadKey'
 
 ###########################################################################
 
@@ -148,57 +150,64 @@ cdef class Attr:
 
     cdef int set_default(self):
         cdef pthread_attr_t attr
-        err = pthread_attr_init(&attr)
-        if err != 0:
-            return err
+        cdef int fail = pthread_attr_init(&attr)
+        if fail:
+            return fail
         return self.set(&attr)
 
     cdef int set(self, const pthread_attr_t *attr):
-        err = pthread_attr_getdetachstate(attr, &self.detachstate)
-        if err != 0:
-            return err
-        err = pthread_attr_getguardsize(attr, &self.guardsize)
-        if err != 0:
-            return err
-        err = pthread_attr_getschedparam(attr, &self.schedparam)
-        if err != 0:
-            return err
-        err = pthread_attr_getschedpolicy(attr, &self.schedpolicy)
-        if err != 0:
-            return err
-        err = pthread_attr_getinheritsched(attr, &self.inheritsched)
-        if err != 0:
-            return err
-        err = pthread_attr_getscope(attr, &self.scope)
-        if err != 0:
-            return err
-        err = pthread_attr_getstack(attr, &self.stackaddr, &self.stacksize)
-        if err != 0:
-            return err
+        cdef int fail
+        fail = pthread_attr_getdetachstate(attr, &self.detachstate)
+        if fail:
+            return fail
+        fail = pthread_attr_getguardsize(attr, &self.guardsize)
+        if fail:
+            return fail
+        fail = pthread_attr_getschedparam(attr, &self.schedparam)
+        if fail:
+            return fail
+        fail = pthread_attr_getschedpolicy(attr, &self.schedpolicy)
+        if fail:
+            return fail
+        fail = pthread_attr_getinheritsched(attr, &self.inheritsched)
+        if fail:
+            return fail
+        fail = pthread_attr_getscope(attr, &self.scope)
+        if fail:
+            return fail
+        fail = \
+            pthread_attr_getstack(
+                attr,
+                &self.stackaddr,
+                &self.stacksize
+            )
+        if fail:
+            return fail
         return 0
 
     cdef int get(self, pthread_attr_t *attr):
-        err = pthread_attr_setdetachstate(attr, self.detachstate)
-        if err != 0:
-            return err
-        err = pthread_attr_setguardsize(attr, self.guardsize)
-        if err != 0:
-            return err
-        err = pthread_attr_setschedparam(attr, &self.schedparam)
-        if err != 0:
-            return err
-        err = pthread_attr_setschedpolicy(attr, self.schedpolicy)
-        if err != 0:
-            return err
-        err = pthread_attr_setinheritsched(attr, self.inheritsched)
-        if err != 0:
-            return err
-        err = pthread_attr_setscope(attr, self.scope)
-        if err != 0:
-            return err
-        err = pthread_attr_setstack(attr, self.stackaddr, self.stacksize)
-        if err != 0:
-            return err
+        cdef int fail
+        fail = pthread_attr_setdetachstate(attr, self.detachstate)
+        if fail:
+            return fail
+        fail = pthread_attr_setguardsize(attr, self.guardsize)
+        if fail:
+            return fail
+        fail = pthread_attr_setschedparam(attr, &self.schedparam)
+        if fail != 0:
+            return fail
+        fail = pthread_attr_setschedpolicy(attr, self.schedpolicy)
+        if fail != 0:
+            return fail
+        fail = pthread_attr_setinheritsched(attr, self.inheritsched)
+        if fail != 0:
+            return fail
+        fail = pthread_attr_setscope(attr, self.scope)
+        if fail != 0:
+            return fail
+        fail = pthread_attr_setstack(attr, self.stackaddr, self.stacksize)
+        if fail:
+            return fail
         return 0
 
 cdef class Thread:
@@ -271,9 +280,9 @@ cdef public int pthread_create \
         void *arg
     ):
     pAttr = Attr()
-    cdef int err = pAttr.init(attr)
-    if err != 0:
-        return err
+    cdef int fail = pAttr.init(attr)
+    if fail:
+        return fail
     t = Thread()
     g = Greenlet()
     t.init(g.name.encode(), pAttr, start_routine, arg)
@@ -740,47 +749,50 @@ cdef class MutexAttr:
 
     cdef int set_default(self):
         cdef pthread_mutexattr_t attr
-        cdef int err
-        err = pthread_mutexattr_init(&attr)
-        if err != 0:
-            return err
+        cdef int fail
+        fail = pthread_mutexattr_init(&attr)
+        if fail:
+            return fail
         return self.set(&attr)
 
     cdef int set(self, const pthread_mutexattr_t *attr):
-        err = pthread_mutexattr_getpshared(attr, &self.pshared)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_gettype(attr, &self.kind)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_getprotocol(attr, &self.protocol)
-        if err != 0:
-            return err
-        err = \
-            pthread_mutexattr_getprioceiling(attr, &self.prioceiling)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_getrobust(attr, &self.robustness)
-        if err != 0:
-            return err
+        cdef int fail = pthread_mutexattr_getpshared(attr, &self.pshared)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_gettype(attr, &self.kind)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_getprotocol(attr, &self.protocol)
+        if fail:
+            return fail
+        fail = \
+            pthread_mutexattr_getprioceiling(
+                attr,
+                &self.prioceiling
+            )
+        if fail:
+            return fail
+        fail = pthread_mutexattr_getrobust(attr, &self.robustness)
+        if fail:
+            return fail
         return 0
 
     cdef int get(self, pthread_mutexattr_t *attr):
-        err = pthread_mutexattr_setpshared(attr, self.pshared)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_settype(attr, self.kind)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_setprotocol(attr, self.protocol)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_setprioceiling(attr, self.prioceiling)
-        if err != 0:
-            return err
-        err = pthread_mutexattr_setrobust(attr, self.robustness)
-        if err != 0:
-            return err
+        cdef int fail = pthread_mutexattr_setpshared(attr, self.pshared)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_settype(attr, self.kind)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_setprotocol(attr, self.protocol)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_setprioceiling(attr, self.prioceiling)
+        if fail:
+            return fail
+        fail = pthread_mutexattr_setrobust(attr, self.robustness)
+        if fail:
+            return fail
         return 0
 
 cdef class Mutex:
@@ -865,9 +877,9 @@ cdef public int pthread_mutex_init \
         (<libc.stdint.uintptr_t*>mutex)[0] = 0
         return 0
     pAttr = MutexAttr()
-    cdef int err = pAttr.init(mutexattr)
-    if err != 0:
-        return err
+    cdef int fail = pAttr.init(mutexattr)
+    if fail:
+        return fail
     pMutex = Mutex()
     pMutex.attr = pAttr
     key = \
@@ -980,9 +992,9 @@ cdef public int pthread_mutex_setprioceiling \
     elif attr.protocol == PTHREAD_PRIO_PROTECT and \
          t.schedparam.sched_priority > attr.prioceiling:
         return libc.errno.EINVAL
-    cdef int err = pMutex.acquire(True, None)
-    if err != 0:
-        return err
+    cdef int fail = pMutex.acquire(True, None)
+    if fail:
+        return fail
     old_ceiling[0] = pMutex.attr.prioceiling
     pMutex.attr.prioceiling = prioceiling
     pMutex.release()
@@ -1022,28 +1034,27 @@ cdef class RwlockAttr:
 
     cdef int set_default(self):
         cdef pthread_rwlockattr_t attr
-        cdef int err
-        err = pthread_rwlockattr_init(&attr)
-        if err != 0:
-            return err
+        cdef int fail = pthread_rwlockattr_init(&attr)
+        if fail:
+            return fail
         return self.set(&attr)
 
     cdef int set(self, const pthread_rwlockattr_t *attr):
-        err = pthread_rwlockattr_getpshared(attr, &self.pshared)
-        if err != 0:
-            return err
-        err = pthread_rwlockattr_getkind_np(attr, &self.pref)
-        if err != 0:
-            return err
+        cdef int fail = pthread_rwlockattr_getpshared(attr, &self.pshared)
+        if fail:
+            return fail
+        fail = pthread_rwlockattr_getkind_np(attr, &self.pref)
+        if fail:
+            return fail
         return 0
 
     cdef int get(self, pthread_rwlockattr_t *attr):
-        err = pthread_rwlockattr_setpshared(attr, self.pshared)
-        if err != 0:
-            return err
-        err = pthread_rwlockattr_setkind_np(attr, self.pref)
-        if err != 0:
-            return err
+        cdef int fail = pthread_rwlockattr_setpshared(attr, self.pshared)
+        if fail:
+            return fail
+        fail = pthread_rwlockattr_setkind_np(attr, self.pref)
+        if fail:
+            return fail
         return 0
 
 cdef class Rwlock_PREFER_READER:
@@ -1133,9 +1144,9 @@ cdef public int pthread_rwlock_init \
         const pthread_rwlockattr_t *attr
     ):
     pAttr = RwlockAttr()
-    cdef int err = pAttr.init(attr)
-    if err != 0:
-        return err
+    cdef int fail = pAttr.init(attr)
+    if fail:
+        return fail
     pRwlock = Rwlock_PREFER_READER()
     pRwlock.attr = pAttr
     key = \
@@ -1246,28 +1257,27 @@ cdef class CondAttr:
 
     cdef int set_default(self):
         cdef pthread_condattr_t attr
-        cdef int err
-        err = pthread_condattr_init(&attr)
-        if err != 0:
-            return err
+        cdef int fail = pthread_condattr_init(&attr)
+        if fail:
+            return fail
         return self.set(&attr)
 
     cdef int set(self, const pthread_condattr_t *attr):
-        err = pthread_condattr_getpshared(attr, &self.pshared)
-        if err != 0:
-            return err
-        err = pthread_condattr_getclock(attr, &self.clock_id)
-        if err != 0:
-            return err
+        cdef int fail = pthread_condattr_getpshared(attr, &self.pshared)
+        if fail:
+            return fail
+        fail = pthread_condattr_getclock(attr, &self.clock_id)
+        if fail != 0:
+            return fail
         return 0
 
     cdef int get(self, pthread_condattr_t *attr):
-        err = pthread_condattr_setpshared(attr, self.pshared)
-        if err != 0:
-            return err
-        err = pthread_condattr_setclock(attr, self.clock_id)
-        if err != 0:
-            return err
+        cdef int fail = pthread_condattr_setpshared(attr, self.pshared)
+        if fail:
+            return fail
+        fail = pthread_condattr_setclock(attr, self.clock_id)
+        if fail:
+            return fail
         return 0
 
 cdef class Cond:
@@ -1293,9 +1303,9 @@ cdef public int pthread_cond_init \
         (<libc.stdint.uintptr_t*>cond)[0] = 0
         return 0
     pAttr = CondAttr()
-    cdef int err = pAttr.init(cond_attr)
-    if err != 0:
-        return err
+    cdef int fail = pAttr.init(cond_attr)
+    if fail:
+        return fail
     pCond = Cond()
     pCond.attr = pAttr
     key = \
@@ -1434,10 +1444,9 @@ cdef class BarrierAttr:
 
     cdef int set_default(self):
         cdef pthread_barrierattr_t attr
-        cdef int err
-        err = pthread_barrierattr_init(&attr)
-        if err != 0:
-            return err
+        cdef int fail = pthread_barrierattr_init(&attr)
+        if fail:
+            return fail
         return self.set(&attr)
 
     cdef int set(self, const pthread_barrierattr_t *attr):
@@ -1501,8 +1510,8 @@ cdef public int pthread_key_create \
         key_limbo_specific = NULL
         key[0] = key_limbo
         return 0
-    if LOCAL_KEY_NAME not in local.__dict__:
-        local.__dict__[LOCAL_KEY_NAME] = {}
+    if LOCAL_KEY not in local.__dict__:
+        local.__dict__[LOCAL_KEY] = {}
     pKey = Key()
     pKey.specific = NULL
     pKey.destr_function = destr_function
@@ -1510,7 +1519,7 @@ cdef public int pthread_key_create \
               <unsigned long>     \
           <libc.stdint.uintptr_t> \
         <cpython.object.PyObject*>pKey
-    local.__dict__[LOCAL_KEY_NAME][id_] = pKey
+    local.__dict__[LOCAL_KEY][id_] = pKey
     key[0] = \
               <pthread_key_t>     \
           <libc.stdint.uintptr_t> \
@@ -1519,7 +1528,7 @@ cdef public int pthread_key_create \
 
 # Destroy KEY.
 cdef public int pthread_key_delete(pthread_key_t key):
-    if LOCAL_KEY_NAME not in local.__dict__:
+    if LOCAL_KEY not in local.__dict__:
         return libc.errno.ESRCH
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
@@ -1532,7 +1541,7 @@ cdef public int pthread_key_delete(pthread_key_t key):
 cdef public void *pthread_getspecific(pthread_key_t key):
     if key == key_limbo:
         return key_limbo_specific
-    if LOCAL_KEY_NAME not in local.__dict__:
+    if LOCAL_KEY not in local.__dict__:
         return NULL
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
@@ -1551,7 +1560,7 @@ cdef public int pthread_setspecific \
     if key == key_limbo:
         key_limbo_specific = pointer
         return 0
-    if LOCAL_KEY_NAME not in local.__dict__:
+    if LOCAL_KEY not in local.__dict__:
         return libc.errno.ESRCH
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
@@ -1576,7 +1585,7 @@ cdef public int pthread_setspecific \
 # in FIFO (first added, first called).                                    #
 ###########################################################################
 '''
-cdef public int pthread_atfork \
+cdef public posix.types.pid_t pthread_atfork \
     (
         void (*prepare) (),
         void (*parent) (),
