@@ -3,6 +3,8 @@
 #include "C10kPthread.h"
 #include "C10kSocket.h"
 
+PyMODINIT_FUNC PyInit__greenlet (void);
+
 static int volatile libc10k_initialized = 0;
 static int volatile libc10k_finalized   = 0;
 

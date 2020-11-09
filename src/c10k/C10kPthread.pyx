@@ -3,6 +3,7 @@
 
 cimport cpython.mem
 cimport cpython.object
+cimport cpython.pycapsule
 cimport cpython.ref
 cimport cython
 cimport libc.errno
@@ -11,7 +12,6 @@ cimport libc.stdio
 cimport libc.stdlib
 cimport posix.time
 cimport posix.types
-cimport posix.unistd
 
 from pthread cimport *
 
@@ -91,32 +91,34 @@ cdef extern from 'C10kPthread.h':
         )
 
 cdef public int C10kPthread_initialized = 0
-cdef        int __concurrency = 0
-cdef pthread_key_t  key_limbo = <pthread_key_t><libc.stdint.uintptr_t>0
-cdef void *key_limbo_specific
+cdef int __concurrency_level = 0
+cdef void *__key_limbo_specific
+cdef pthread_key_t  __key_limbo = <pthread_key_t><libc.stdint.uintptr_t>0
 cdef pthread_once_t ONCE_DONE = <pthread_once_t><unsigned int>-1
 cdef pthread_t TH_MAIN = <pthread_t><libc.stdint.uintptr_t>0
 
 ###########################################################################
 
-import sys
-# TODO
-#sys.setswitchinterval(0xffffffff)
-
-import gevent.greenlet
-# XXX
-gevent.greenlet._cancelled_start_event = gevent.greenlet._dummy_event()
-gevent.greenlet._start_completed_event = gevent.greenlet._dummy_event()
-
 import gevent
+import gevent._greenlet
 import gevent.event
 import gevent.local
 import gevent.lock
+import gevent.os
 import gevent.queue
+import sys
 import weakref
 
 from gevent._greenlet import Greenlet
 
+dummy_event_finder = gevent.Greenlet(lambda: None)
+dummy_event_finder.throw(gevent.GreenletExit)
+_cancelled_start_event = (<Greenlet?>dummy_event_finder)._start_event
+dummy_event_finder = gevent.Greenlet(lambda: None)
+dummy_event_finder.start()
+dummy_event_finder.join()
+_start_completed_event = (<Greenlet?>dummy_event_finder)._start_event
+del dummy_event_finder
 g_main    = gevent.getcurrent()
 greenlets = \
     {
@@ -126,8 +128,13 @@ greenlets = \
 mutexes   = {}
 rwlocks   = {}
 conds     = {}
-local     = gevent.local.local()
+barriers  = {}
+atfork_prepare = []
+atfork_parent  = []
+atfork_child   = []
+__local   = gevent.local.local()
 LOCAL_KEY = 'C10kPthreadKey'
+sys.setswitchinterval(0xffffffff)
 
 ###########################################################################
 
@@ -240,10 +247,10 @@ cdef class Thread:
 def run():
     g = <Greenlet?>gevent.getcurrent()
     if g._start_event is None:
-        g._start_event = gevent.greenlet._cancelled_start_event
-    g._start_event.stop()
+        g._start_event = _cancelled_start_event
+    g._start_event. stop()
     g._start_event.close()
-    g._start_event = gevent.greenlet._start_completed_event
+    g._start_event = _start_completed_event
     t = <Thread?>g.args[0]
     cdef void *start_routine = t.start_routine
     cdef void *arg = t.arg
@@ -583,13 +590,14 @@ cdef public int pthread_setname_np \
 
 # Determine level of concurrency.
 cdef public int pthread_getconcurrency():
-    return __concurrency
+    return __concurrency_level
 
 # Set new concurrency level to LEVEL.
 cdef public int pthread_setconcurrency(int level):
     if level < 0:
         return libc.errno.EINVAL
-    __concurrency = level
+    global  __concurrency_level
+    __concurrency_level = level
     return 0
 
 # Yield the processor to another thread or process.
@@ -852,6 +860,7 @@ cdef class Mutex:
         if not count:
             self._owner = None
             self._block.release()
+        return 0
 
     cdef int cond_wait_check(self):
         if PTHREAD_MUTEX_ERRORCHECK == self.attr.kind or \
@@ -1061,33 +1070,33 @@ cdef class Rwlock_PREFER_READER:
 
     cdef RwlockAttr attr
     cdef int    balance
-    cdef object lock
-    cdef object ready
-    cdef dict   owners
+    cdef object _block
+    cdef object _ready
+    cdef dict   _owner
     cdef object __weakref__
 
     def __init__(self):
         self.balance = 0
-        self.lock    = gevent.lock.Semaphore(1)
-        self.ready   = gevent.event.Event()
-        self.owners  = {}
+        self._block  = gevent.lock.Semaphore(1)
+        self._ready  = gevent.event.Event()
+        self._owner  = {}
 
     cdef int rd_acquire(self, blocking=True, timeout=None):
         g   = gevent.getcurrent()
         key = <unsigned long><libc.stdint.uintptr_t><PyGreenlet*>g
-        if key in self.owners:
+        if key in self._owner:
             return EDEADLK
         if self.balance > 0:
             self.balance += 1
-            self.owners[key] = 0
+            self._owner[key] = 0
             return 0
         elif 0 == self.balance:
             self.balance = -1
-            rc = self.lock.acquire(blocking, timeout)
+            rc = self._block.acquire(blocking, timeout)
             if rc:
                 self.balance = abs(self.balance)
-                self.ready.set()
-                self.owners[key] = 0
+                self._ready.set()
+                self._owner[key] = 0
                 return 0
             else:
                 if timeout is None:
@@ -1096,9 +1105,9 @@ cdef class Rwlock_PREFER_READER:
                     return libc.errno.ETIMEDOUT
         else:
             self.balance -= 1
-            rc = self.ready.wait(timeout)
+            rc = self._ready.wait(timeout)
             if rc:
-                self.owners[key] = 0
+                self._owner[key] = 0
                 return 0
             else:
                 return libc.errno.ETIMEDOUT
@@ -1106,11 +1115,11 @@ cdef class Rwlock_PREFER_READER:
     cdef int wr_acquire(self, blocking, timeout):
         g   = gevent.getcurrent()
         key = <unsigned long><libc.stdint.uintptr_t><PyGreenlet*>g
-        if key in self.owners:
+        if key in self._owner:
             return EDEADLK
-        rc = self.lock.acquire(blocking, timeout)
+        rc = self._block.acquire(blocking, timeout)
         if rc:
-            self.owner[key] = 1
+            self._owner[key] = 1
             return 0
         else:
             if timeout is None:
@@ -1121,19 +1130,19 @@ cdef class Rwlock_PREFER_READER:
     cdef int release(self):
         g   = gevent.getcurrent()
         key = <unsigned long><libc.stdint.uintptr_t><PyGreenlet*>g
-        is_writer = self.owner.get(key)
+        is_writer = self._owner.get(key)
         if key is None:
             return libc.errno.EPERM
         if key:
-            self.lock.release()
-            del self.owner[key]
+            self._block.release()
+            del self._owner[key]
             return 0
         else:
             self.balance -= 1
             if 0 == self.balance:
-                self.ready.clear()
-                self.lock.release()
-            del self.owner[key]
+                self._ready.clear()
+                self._block.release()
+            del self._owner[key]
             return 0
 
 # Initialize read-write lock RWLOCK using attributes ATTR, or use
@@ -1173,7 +1182,7 @@ cdef public int pthread_rwlock_destroy(pthread_rwlock_t *rwlock):
 cdef public int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.rd_acquire(True, None)
@@ -1182,7 +1191,7 @@ cdef public int pthread_rwlock_rdlock(pthread_rwlock_t *rwlock):
 cdef public int pthread_rwlock_tryrdlock(pthread_rwlock_t *rwlock):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.rd_acquire(False, None)
@@ -1195,7 +1204,7 @@ cdef public int pthread_rwlock_timedrdlock \
     ):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.rd_acquire(True, <long>abstime.tv_sec)
@@ -1204,7 +1213,7 @@ cdef public int pthread_rwlock_timedrdlock \
 cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.wr_acquire(True, None)
@@ -1213,7 +1222,7 @@ cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
 cdef public int pthread_rwlock_trywrlock(pthread_rwlock_t *rwlock):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.wr_acquire(False, None)
@@ -1226,7 +1235,7 @@ cdef public int pthread_rwlock_timedwrlock \
     ):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.wr_acquire(True, <long>abstime.tv_sec)
@@ -1235,7 +1244,7 @@ cdef public int pthread_rwlock_timedwrlock \
 cdef public int pthread_rwlock_unlock(pthread_rwlock_t *rwlock):
     key = <unsigned long>(<libc.stdint.uintptr_t*>rwlock)[0]
     try:
-        pRwlock = rwlocks[key]
+        pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
     return pRwlock.release()
@@ -1372,6 +1381,14 @@ cdef public int pthread_cond_wait \
     ):
     if 0 == (<libc.stdint.uintptr_t*>cond)[0]:
         return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
+    try:
+        pMutex = <Mutex?>mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    fail = pMutex.cond_wait_check()
+    if fail:
+        return fail
     key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
         pCond = conds[key]
@@ -1393,6 +1410,14 @@ cdef public int pthread_cond_timedwait \
         pthread_mutex_t *mutex,
         const posix.time.timespec *abstime
     ):
+    key = <unsigned long>(<libc.stdint.uintptr_t*>mutex)[0]
+    try:
+        pMutex = <Mutex?>mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    fail = pMutex.cond_wait_check()
+    if fail:
+        return fail
     key = <unsigned long>(<libc.stdint.uintptr_t*>cond)[0]
     try:
         pCond = conds[key]
@@ -1401,37 +1426,76 @@ cdef public int pthread_cond_timedwait \
     pCond.queue.get(block=True, timeout=<long>abstime.tv_sec)
     return 0
 
-# TODO
 ###########################################################################
 #                     Functions to handle spinlocks.                      #
 ###########################################################################
-'''
+
 # Initialize the spinlock LOCK.  If PSHARED is nonzero the spinlock can
 # be shared between different processes.
 cdef public int pthread_spin_init(pthread_spinlock_t *lock, int pshared):
+    pAttr = MutexAttr()
+    cdef int fail = pAttr.init(NULL)
+    pAttr.pshared = pshared
+    if fail:
+        return fail
+    pMutex = Mutex()
+    pMutex.attr = pAttr
+    key = \
+              <unsigned long>     \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pMutex
+    mutexes[key] = pMutex
+    (<libc.stdint.uintptr_t*>lock)[0] = \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pMutex
     return 0
 
 # Destroy the spinlock LOCK.
 cdef public int pthread_spin_destroy(pthread_spinlock_t *lock):
-    return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>lock)[0]
+    try:
+        del mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    else:
+        return 0
 
 # Wait until spinlock LOCK is retrieved.
 cdef public int pthread_spin_lock(pthread_spinlock_t *lock):
-    return 0
+    if 0 == (<libc.stdint.uintptr_t*>lock)[0]:
+        return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>lock)[0]
+    try:
+        pMutex = <Mutex?>mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    cdef int rc = pMutex.acquire(False, None)
+    while libc.errno.EBUSY == rc:
+        rc = pMutex.acquire(False, None)
+    return rc
 
 # Try to lock spinlock LOCK.
 cdef public int pthread_spin_trylock(pthread_spinlock_t *lock):
-    return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>lock)[0]
+    try:
+        pMutex = <Mutex?>mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    return pMutex.acquire(False, None)
 
 # Release spinlock LOCK.
 cdef public int pthread_spin_unlock(pthread_spinlock_t *lock):
-    return 0
-'''
-# TODO
+    key = <unsigned long>(<libc.stdint.uintptr_t*>lock)[0]
+    try:
+        pMutex = <Mutex?>mutexes[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    return pMutex.release()
+
 ###########################################################################
 #                      Functions to handle barriers.                      #
 ###########################################################################
-'''
+
 cdef class BarrierAttr:
 
     cdef int pshared
@@ -1458,6 +1522,9 @@ cdef class BarrierAttr:
 cdef class Barrier:
 
     cdef BarrierAttr attr
+    cdef int count
+    cdef int waiters
+    cdef object ready
 
     cdef int init(self, BarrierAttr attr):
         self.attr = attr
@@ -1471,16 +1538,52 @@ cdef public int pthread_barrier_init \
         const pthread_barrierattr_t *attr,
         unsigned int count
     ):
+    pAttr = BarrierAttr()
+    cdef int fail = pAttr.init(attr)
+    if fail:
+        return fail
+    pBarrier = Barrier()
+    pBarrier.attr    = pAttr
+    pBarrier.count   = count
+    pBarrier.waiters = 0
+    pBarrier.ready   = gevent.event.Event()
+    key = \
+              <unsigned long>     \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pBarrier
+    barriers[key] = pBarrier
+    (<libc.stdint.uintptr_t*>barrier)[0] = \
+          <libc.stdint.uintptr_t> \
+        <cpython.object.PyObject*>pBarrier
     return 0
 
 # Destroy a previously dynamically initialized barrier BARRIER.
 cdef public int pthread_barrier_destroy(pthread_barrier_t *barrier):
-    return 0
+    key = <unsigned long>(<libc.stdint.uintptr_t*>barrier)[0]
+    try:
+        del barriers[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    else:
+        return 0
 
 # Wait on barrier BARRIER.
 cdef public int pthread_barrier_wait(pthread_barrier_t *barrier):
-    return 0
-'''
+    key = <unsigned long>(<libc.stdint.uintptr_t*>barrier)[0]
+    try:
+        pBarrier = <Barrier?>barriers[key]
+    except KeyError:
+        return libc.errno.ESRCH
+    cdef waiters = pBarrier.waiters + 1
+    if waiters >= pBarrier.count:
+        pBarrier.waiters = 0
+        pBarrier.ready.set()
+        return 0
+    else:
+        pBarrier.waiters = waiters
+        pBarrier.ready.wait()
+        return 0
+
 ###########################################################################
 #              Functions for handling thread-specific data.               #
 ###########################################################################
@@ -1505,13 +1608,13 @@ cdef public int pthread_key_create \
         pthread_key_t *key,
         void (*destr_function) (void *) nogil
     ):
-    global key_limbo_specific
+    global __key_limbo_specific
     if not C10kPthread_initialized:
-        key_limbo_specific = NULL
-        key[0] = key_limbo
+        __key_limbo_specific = NULL
+        key[0] = __key_limbo
         return 0
-    if LOCAL_KEY not in local.__dict__:
-        local.__dict__[LOCAL_KEY] = {}
+    if LOCAL_KEY not in __local.__dict__:
+        __local.__dict__[LOCAL_KEY] = {}
     pKey = Key()
     pKey.specific = NULL
     pKey.destr_function = destr_function
@@ -1519,7 +1622,7 @@ cdef public int pthread_key_create \
               <unsigned long>     \
           <libc.stdint.uintptr_t> \
         <cpython.object.PyObject*>pKey
-    local.__dict__[LOCAL_KEY][id_] = pKey
+    __local.__dict__[LOCAL_KEY][id_] = pKey
     key[0] = \
               <pthread_key_t>     \
           <libc.stdint.uintptr_t> \
@@ -1528,24 +1631,24 @@ cdef public int pthread_key_create \
 
 # Destroy KEY.
 cdef public int pthread_key_delete(pthread_key_t key):
-    if LOCAL_KEY not in local.__dict__:
+    if LOCAL_KEY not in __local.__dict__:
         return libc.errno.ESRCH
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
-        del local.__dict__[id_]
+        del __local.__dict__[id_]
     except KeyError:
         return libc.errno.ESRCH
     return 0
 
 # Return current value of the thread-specific data slot identified by KEY.
 cdef public void *pthread_getspecific(pthread_key_t key):
-    if key == key_limbo:
-        return key_limbo_specific
-    if LOCAL_KEY not in local.__dict__:
+    if key == __key_limbo:
+        return __key_limbo_specific
+    if LOCAL_KEY not in __local.__dict__:
         return NULL
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
-        pKey = <Key?>local.__dict__[id_]
+        pKey = <Key?>__local.__dict__[id_]
     except KeyError:
         return NULL
     return pKey.specific
@@ -1556,21 +1659,20 @@ cdef public int pthread_setspecific \
         pthread_key_t key,
         const void *pointer
     ):
-    global key_limbo_specific
-    if key == key_limbo:
-        key_limbo_specific = pointer
+    global __key_limbo_specific
+    if key == __key_limbo:
+        __key_limbo_specific = pointer
         return 0
-    if LOCAL_KEY not in local.__dict__:
+    if LOCAL_KEY not in __local.__dict__:
         return libc.errno.ESRCH
     id_ = <unsigned long><libc.stdint.uintptr_t>key
     try:
-        pKey = <Key?>local.__dict__[id_]
+        pKey = <Key?>__local.__dict__[id_]
     except KeyError:
         return libc.errno.ESRCH
     pKey.specific = pointer
     return 0
 
-# TODO
 ###########################################################################
 # Install handlers to be called when a new process is created with FORK.  #
 # The PREPARE handler is called in the parent process just before         #
@@ -1584,12 +1686,55 @@ cdef public int pthread_setspecific \
 # first called before FORK), and the PARENT and CHILD handlers are called #
 # in FIFO (first added, first called).                                    #
 ###########################################################################
-'''
-cdef public posix.types.pid_t pthread_atfork \
+
+cdef public int pthread_atfork \
     (
         void (*prepare) (),
         void (*parent) (),
         void (*child) ()
     ):
+    if prepare != NULL:
+        atfork_prepare.append(
+            cpython.pycapsule.PyCapsule_New(
+                <void*>prepare,
+                NULL,
+                NULL
+            )
+        )
+    if parent != NULL:
+        atfork_parent.append(
+            cpython.pycapsule.PyCapsule_New(
+                <void*>parent,
+                NULL,
+                NULL
+            )
+        )
+    if child != NULL:
+        atfork_child.append(
+            cpython.pycapsule.PyCapsule_New(
+                <void*>child,
+                NULL,
+                NULL
+            )
+        )
     return 0
-'''
+
+cdef public posix.types.pid_t fork():
+    cdef (void (*) ()) cb
+    for capsule in atfork_prepare:
+        cb = <void (*) ()> \
+            cpython.pycapsule.PyCapsule_GetPointer(capsule, NULL)
+        cb()
+    pid = gevent.os.fork()
+    if 0 == pid:
+        for capsule in atfork_child:
+            cb = <void (*) ()> \
+                cpython.pycapsule.PyCapsule_GetPointer(capsule, NULL)
+            cb()
+        return 0
+    else:
+        for capsule in atfork_parent:
+            cb = <void (*) ()> \
+                cpython.pycapsule.PyCapsule_GetPointer(capsule, NULL)
+            cb()
+        return <posix.types.pid_t>pid
