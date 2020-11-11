@@ -93,8 +93,8 @@ cdef extern from 'C10kPthread.h':
 cdef public int C10kPthread_initialized = 0
 cdef int __concurrency_level = 0
 cdef void *__key_limbo_specific
-cdef pthread_key_t  __key_limbo = <pthread_key_t><libc.stdint.uintptr_t>0
-cdef pthread_once_t ONCE_DONE = <pthread_once_t><unsigned int>-1
+cdef pthread_key_t __key_limbo = <pthread_key_t><libc.stdint.uintptr_t>0
+cdef pthread_once_t  ONCE_DONE = <pthread_once_t><unsigned int>-1
 cdef pthread_t TH_MAIN = <pthread_t><libc.stdint.uintptr_t>0
 
 ###########################################################################
@@ -107,6 +107,7 @@ import gevent.lock
 import gevent.os
 import gevent.queue
 import sys
+import time
 import weakref
 
 from gevent._greenlet import Greenlet
@@ -140,7 +141,7 @@ sys.setswitchinterval(0xffffffff)
 
 cdef class Attr:
 
-    cdef int detachstate
+    cdef int  detachstate
     cdef size_t guardsize
     cdef sched_param schedparam
     cdef int schedpolicy
@@ -223,7 +224,7 @@ cdef class Thread:
     cdef Attr  attr
     cdef int cancelstate
     cdef int canceltype
-    cdef void *(*start_routine) (void *)
+    cdef void *(*start_routine) (void *) nogil
     cdef void *arg
     cdef void *retval
 
@@ -232,7 +233,7 @@ cdef class Thread:
             self,
             bytes name,
             Attr  attr,
-            void  *(*start_routine) (void *),
+            void  *(*start_routine) (void *) nogil,
             void  *arg
         ):
         self.name = name
@@ -248,7 +249,7 @@ def run():
     g = <Greenlet?>gevent.getcurrent()
     if g._start_event is None:
         g._start_event = _cancelled_start_event
-    g._start_event. stop()
+    g._start_event.stop()
     g._start_event.close()
     g._start_event = _start_completed_event
     t = <Thread?>g.args[0]
@@ -256,7 +257,7 @@ def run():
     cdef void *arg = t.arg
     del t
     del g
-    cdef void *retval = (<void *(*) (void*)>start_routine)(arg)
+    cdef void *retval = (<void *(*) (void *) nogil>start_routine)(arg)
     g   = <Greenlet?>gevent.getcurrent()
     t   = <Thread?>g.args[0]
     key = \
@@ -283,7 +284,7 @@ cdef public int pthread_create \
     (
         pthread_t *newthread,
         const pthread_attr_t *attr,
-        void *(*start_routine) (void *),
+        void *(*start_routine) (void *) nogil,
         void *arg
     ):
     pAttr = Attr()
@@ -413,7 +414,7 @@ cdef public int pthread_timedjoin_np \
         return libc.errno.ESRCH
     if t.attr.detachstate != PTHREAD_CREATE_JOINABLE:
         return libc.errno.EINVAL
-    g.join(timeout=<long>abstime.tv_sec)
+    g.join(timeout=max(<long>abstime.tv_sec-int(time.time()), 0))
     if g.ready():
         if thread_return != NULL:
             thread_return = &t.retval
@@ -944,7 +945,11 @@ cdef public int pthread_mutex_timedlock \
         pMutex = <Mutex?>mutexes[key]
     except KeyError:
         return libc.errno.ESRCH
-    return pMutex.acquire(True, <long>abstime.tv_sec)
+    return \
+        pMutex.acquire(
+            True,
+            max(<long>abstime.tv_sec-int(time.time()), 0)
+        )
 
 # Unlock a mutex.
 cdef public int pthread_mutex_unlock(pthread_mutex_t *mutex):
@@ -1207,7 +1212,11 @@ cdef public int pthread_rwlock_timedrdlock \
         pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
-    return pRwlock.rd_acquire(True, <long>abstime.tv_sec)
+    return \
+        pRwlock.rd_acquire(
+            True,
+            max(<long>abstime.tv_sec-int(time.time()), 0)
+        )
 
 # Acquire write lock for RWLOCK.
 cdef public int pthread_rwlock_wrlock(pthread_rwlock_t *rwlock):
@@ -1238,7 +1247,11 @@ cdef public int pthread_rwlock_timedwrlock \
         pRwlock = <Rwlock_PREFER_READER?>rwlocks[key]
     except KeyError:
         return libc.errno.ESRCH
-    return pRwlock.wr_acquire(True, <long>abstime.tv_sec)
+    return \
+        pRwlock.wr_acquire(
+            True,
+            max(<long>abstime.tv_sec-int(time.time()), 0)
+        )
 
 # Unlock RWLOCK.
 cdef public int pthread_rwlock_unlock(pthread_rwlock_t *rwlock):
@@ -1376,7 +1389,7 @@ cdef public int pthread_cond_broadcast(pthread_cond_t *cond):
 # __THROW.
 cdef public int pthread_cond_wait \
     (
-        pthread_cond_t *cond,
+        pthread_cond_t  *cond,
         pthread_mutex_t *mutex
     ):
     if 0 == (<libc.stdint.uintptr_t*>cond)[0]:
@@ -1406,7 +1419,7 @@ cdef public int pthread_cond_wait \
 # __THROW.
 cdef public int pthread_cond_timedwait \
     (
-        pthread_cond_t *cond,
+        pthread_cond_t  *cond,
         pthread_mutex_t *mutex,
         const posix.time.timespec *abstime
     ):
@@ -1423,7 +1436,10 @@ cdef public int pthread_cond_timedwait \
         pCond = conds[key]
     except KeyError:
         return libc.errno.ESRCH
-    pCond.queue.get(block=True, timeout=<long>abstime.tv_sec)
+    pCond.queue.get(
+          block=True,
+        timeout=max(<long>abstime.tv_sec-int(time.time()), 0)
+    )
     return 0
 
 ###########################################################################
@@ -1694,34 +1710,40 @@ cdef public int pthread_atfork \
         void (*child) ()
     ):
     if prepare != NULL:
-        atfork_prepare.append(
-            cpython.pycapsule.PyCapsule_New(
+        try:
+            capsule = cpython.pycapsule.PyCapsule_New(
                 <void*>prepare,
                 NULL,
                 NULL
             )
-        )
+        except MemoryError:
+            return libc.errno.ENOMEM
+        atfork_prepare.append(capsule)
     if parent != NULL:
-        atfork_parent.append(
-            cpython.pycapsule.PyCapsule_New(
+        try:
+            capsule = cpython.pycapsule.PyCapsule_New(
                 <void*>parent,
                 NULL,
                 NULL
             )
-        )
+        except MemoryError:
+            return libc.errno.ENOMEM
+        atfork_parent.append(capsule)
     if child != NULL:
-        atfork_child.append(
-            cpython.pycapsule.PyCapsule_New(
+        try:
+            capsule = cpython.pycapsule.PyCapsule_New(
                 <void*>child,
                 NULL,
                 NULL
             )
-        )
+        except MemoryError:
+            return libc.errno.ENOMEM
+        atfork_child.append(capsule)
     return 0
 
 cdef public posix.types.pid_t fork():
     cdef (void (*) ()) cb
-    for capsule in atfork_prepare:
+    for capsule in reversed(atfork_prepare):
         cb = <void (*) ()> \
             cpython.pycapsule.PyCapsule_GetPointer(capsule, NULL)
         cb()
